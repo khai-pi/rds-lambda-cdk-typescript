@@ -75,6 +75,7 @@ export class RdsLambdaConstruct extends Construct {
     });
 
     // Create Lambda function
+    // TODO: Bundling code
     this.handler = new lambda.Function(this, 'RdsLambdaHandler', {
       runtime: lambda.Runtime.NODEJS_18_X,
       handler: 'index.handler',
