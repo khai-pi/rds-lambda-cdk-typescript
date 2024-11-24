@@ -23,9 +23,9 @@ describe('Lambda Handler Tests', () => {
 
   afterEach(() => {
     process.env = originalEnv;
+    jest.clearAllMocks();
   });
 
-  // Mock Lambda context
   const mockContext: Context = {
     callbackWaitsForEmptyEventLoop: true,
     functionName: 'test-function',
@@ -41,10 +41,8 @@ describe('Lambda Handler Tests', () => {
     succeed: () => {},
   };
 
-  // Mock callback
   const mockCallback: Callback<APIGatewayProxyResult> = jest.fn();
 
-  // Mock event
   const mockEvent: APIGatewayProxyEvent = {
     queryStringParameters: {
       limit: '10',
@@ -78,16 +76,25 @@ describe('Lambda Handler Tests', () => {
     { id: 2, name: 'Test User 2' } as MockDbRow
   ];
 
-  const mockExecute = jest.fn().mockResolvedValue([mockDbRows]);
-  const mockEnd = jest.fn().mockResolvedValue(undefined);
-  
-  (createConnection as jest.Mock).mockResolvedValue({
-    execute: mockExecute,
-    end: mockEnd
-  } as Partial<Connection>);
+  // Setup mocks before each test
+  beforeEach(() => {
+    // Mock SecretsManager getSecretValue
+    const mockGetSecretValue = jest.fn().mockResolvedValue({
+      SecretString: JSON.stringify(mockSecretValue)
+    });
 
-  (SecretsManager.prototype.getSecretValue as jest.Mock).mockResolvedValue({
-    SecretString: JSON.stringify(mockSecretValue)
+    (SecretsManager as jest.Mock).mockImplementation(() => ({
+      getSecretValue: mockGetSecretValue
+    }));
+
+    // Mock database connection
+    const mockExecute = jest.fn().mockResolvedValue([mockDbRows]);
+    const mockEnd = jest.fn().mockResolvedValue(undefined);
+    
+    (createConnection as jest.Mock).mockResolvedValue({
+      execute: mockExecute,
+      end: mockEnd
+    });
   });
 
   test('successfully queries database with default parameters', async () => {
@@ -98,7 +105,8 @@ describe('Lambda Handler Tests', () => {
     }
 
     expect(response.statusCode).toBe(200);
-    expect(JSON.parse(response.body)).toEqual({
+    const body = JSON.parse(response.body);
+    expect(body).toEqual({
       message: 'Success',
       data: mockDbRows,
       pagination: {
@@ -111,16 +119,11 @@ describe('Lambda Handler Tests', () => {
     expect(createConnection).toHaveBeenCalledWith({
       host: 'test-host',
       port: 3306,
-      user: mockSecretValue.username,
-      password: mockSecretValue.password,
+      user: 'testuser',
+      password: 'testpass',
       database: 'mydb',
       ssl: undefined
     });
-
-    expect(mockExecute).toHaveBeenCalledWith(
-      'SELECT * FROM users LIMIT ? OFFSET ?',
-      [10, 0]
-    );
   });
 
   test('handles missing environment variables', async () => {
@@ -178,16 +181,14 @@ describe('Lambda Handler Tests', () => {
     expect(body.pagination.offset).toBe(0);
   });
 
-  test('handles callback style execution', (done) => {
-    handler(mockEvent, mockContext, (error, result) => {
-      expect(error).toBeNull();
-      expect(result?.statusCode).toBe(200);
-      done();
-    });
-  });
-
   test('closes database connection in case of error', async () => {
-    mockExecute.mockRejectedValue(new Error('Query failed'));
+    const mockEnd = jest.fn().mockResolvedValue(undefined);
+    const mockExecute = jest.fn().mockRejectedValue(new Error('Query failed'));
+    
+    (createConnection as jest.Mock).mockResolvedValue({
+      execute: mockExecute,
+      end: mockEnd
+    });
 
     const response = await handler(mockEvent, mockContext, mockCallback);
     

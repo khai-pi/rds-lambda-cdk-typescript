@@ -78,39 +78,7 @@ export class RdsLambdaConstruct extends Construct {
     this.handler = new lambda.Function(this, 'RdsLambdaHandler', {
       runtime: lambda.Runtime.NODEJS_18_X,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset('lambda', {
-        bundling: {
-          // Use the same image as the Lambda runtime
-          image: lambda.Runtime.NODEJS_18_X.bundlingImage,
-          
-          // Bundle configuration
-          command: [
-            'bash', 
-            '-c',
-            [
-              // Install dependencies
-              'npm install',
-              
-              // Bundle with esbuild
-              'esbuild index.ts',         // Source file
-              '--bundle',                 // Bundle all dependencies
-              '--platform=node',          // Target Node.js
-              '--target=node18',          // Specific Node version
-              '--external:aws-sdk',       // Exclude AWS SDK (available in Lambda)
-              '--minify',                 // Minimize output
-              '--sourcemap',              // Include sourcemaps for debugging
-              '--outfile=/asset-output/index.js'  // Output location
-            ].join(' ')
-          ],
-        },
-        // Exclude unnecessary files
-        exclude: [
-          'node_modules/**',
-          '*.ts',
-          'package*.json',
-          'README.md',
-        ],
-      }),
+      code: lambda.Code.fromAsset('lambda'),
       vpc,
       vpcSubnets: {
         subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,

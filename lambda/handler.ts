@@ -1,12 +1,6 @@
+import { APIGatewayProxyHandler, APIGatewayProxyResult } from 'aws-lambda';
 import { SecretsManager } from '@aws-sdk/client-secrets-manager';
 import { createConnection, Connection } from 'mysql2/promise';
-import { 
-  APIGatewayProxyHandler, 
-  APIGatewayProxyEvent, 
-  APIGatewayProxyResult 
-} from 'aws-lambda';
-
-const secretsManager = new SecretsManager();
 
 interface DBSecret {
   username: string;
@@ -18,40 +12,35 @@ interface QueryParams {
   offset: string;
 }
 
-export const handler: APIGatewayProxyHandler = async (
-  event: APIGatewayProxyEvent
-): Promise<APIGatewayProxyResult> => {
+export const handler: APIGatewayProxyHandler = async (event, context): Promise<APIGatewayProxyResult> => {
   let connection: Connection | undefined;
   
+  // Set this to false to prevent connection hanging
+  context.callbackWaitsForEmptyEventLoop = false;
+  
   try {
-    // Parse query parameters with proper type handling
-    const queryParams: QueryParams = {
-      limit: '10',  // default value
-      offset: '0'   // default value
-    };
-
-    if (event.queryStringParameters) {
-      // Safely handle potentially undefined values
-      const { limit, offset } = event.queryStringParameters;
-      if (limit !== undefined) queryParams.limit = limit;
-      if (offset !== undefined) queryParams.offset = offset;
+    // Validate environment variables first
+    if (!process.env.DB_HOST) {
+      throw new Error('Server configuration error');
     }
 
-    // Get database credentials from Secrets Manager
+    // Parse query parameters
+    const queryParams: QueryParams = {
+      limit: event.queryStringParameters?.limit || '10',
+      offset: event.queryStringParameters?.offset || '0'
+    };
+
+    // Get database credentials
+    const secretsManager = new SecretsManager();
     const secretResponse = await secretsManager.getSecretValue({
-      SecretId: process.env.DB_SECRET_ARN!,
+      SecretId: process.env.DB_SECRET_ARN!
     });
-    
+
     if (!secretResponse.SecretString) {
       throw new Error('Database credentials not found');
     }
 
     const dbSecret: DBSecret = JSON.parse(secretResponse.SecretString);
-    
-    // Validate environment variables
-    if (!process.env.DB_HOST) {
-      throw new Error('DB_HOST environment variable is not set');
-    }
 
     // Create database connection
     connection = await createConnection({
@@ -59,14 +48,19 @@ export const handler: APIGatewayProxyHandler = async (
       port: parseInt(process.env.DB_PORT || '3306'),
       user: dbSecret.username,
       password: dbSecret.password,
-      database: 'mydb',
-      ssl: process.env.NODE_ENV === 'production' ? {} : undefined // Enable SSL in production
+      database: 'mydb'
+    }).catch(error => {
+      if (error.message.includes('ECONNREFUSED')) {
+        throw new Error('Database connection failed');
+      }
+      throw error;
     });
 
-    // Example query with pagination and parameter validation
-    const limit = Math.min(parseInt(queryParams.limit), 100); // Cap at 100 items
-    const offset = Math.max(parseInt(queryParams.offset), 0); // Ensure non-negative
+    // Validate and normalize parameters
+    const limit = Math.min(parseInt(queryParams.limit), 100);
+    const offset = Math.max(parseInt(queryParams.offset), 0);
 
+    // Execute query
     const [rows] = await connection.execute(
       'SELECT * FROM users LIMIT ? OFFSET ?',
       [limit, offset]
@@ -74,10 +68,6 @@ export const handler: APIGatewayProxyHandler = async (
     
     return {
       statusCode: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      },
       body: JSON.stringify({
         message: 'Success',
         data: rows,
@@ -93,34 +83,31 @@ export const handler: APIGatewayProxyHandler = async (
     
     let statusCode = 500;
     let errorMessage = 'Internal server error';
+    let errorType = 'Error';
 
     if (error instanceof Error) {
+      errorType = error.constructor.name;
       switch (error.message) {
-        case 'Database credentials not found':
-          statusCode = 403;
+        case 'Server configuration error':
+          statusCode = 500;
           errorMessage = error.message;
           break;
-        case 'DB_HOST environment variable is not set':
-          statusCode = 500;
-          errorMessage = 'Server configuration error';
+        case 'Database connection failed':
+          statusCode = 503;
+          errorMessage = error.message;
           break;
-        default:
-          if (error.message.includes('ECONNREFUSED')) {
-            statusCode = 503;
-            errorMessage = 'Database connection failed';
-          }
+        case 'Database credentials not found':
+          statusCode = 500;
+          errorMessage = error.message;
+          break;
       }
     }
 
     return {
       statusCode,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-      },
-      body: JSON.stringify({ 
+      body: JSON.stringify({
         message: errorMessage,
-        errorType: error instanceof Error ? error.name : 'UnknownError'
+        errorType
       })
     };
   } finally {
@@ -128,7 +115,7 @@ export const handler: APIGatewayProxyHandler = async (
       try {
         await connection.end();
       } catch (error) {
-        console.error('Error closing database connection:', error);
+        console.error('Error closing connection:', error);
       }
     }
   }
