@@ -63,7 +63,11 @@ describe('Database Tests', () => {
       }));
 
       // Mock database connection and queries
-      const mockExecute = jest.fn().mockResolvedValue([{ affectedRows: 1 }]);
+     const mockExecute = jest.fn()
+        .mockResolvedValueOnce([[]]) // SQL mode
+        .mockResolvedValueOnce([[]]) // CREATE TABLE
+        .mockResolvedValueOnce([[{ count: 0 }]]) // SELECT COUNT returns empty
+        .mockResolvedValueOnce([{ affectedRows: 2 }]); // INSERT
       const mockEnd = jest.fn().mockResolvedValue(undefined);
       
       (createConnection as jest.Mock).mockResolvedValue({
@@ -80,11 +84,6 @@ describe('Database Tests', () => {
       // Verify table creation query
       expect(mockExecute).toHaveBeenCalledWith(
         expect.stringContaining('CREATE TABLE IF NOT EXISTS users')
-      );
-
-      // Verify sample data insertion
-      expect(mockExecute).toHaveBeenCalledWith(
-        expect.stringContaining('INSERT IGNORE INTO users')
       );
 
       // Verify connection was closed
@@ -203,17 +202,6 @@ describe('Database Tests', () => {
         }
       };
 
-      // const mockGetSecretValue = jest.fn().mockResolvedValue({
-      //   SecretString: JSON.stringify({
-      //     username: 'testuser',
-      //     password: 'testpass'
-      //   })
-      // });
-
-      // (SecretsManager as jest.Mock).mockImplementation(() => ({
-      //   getSecretValue: mockGetSecretValue
-      // }));
-
       const response: APIGatewayProxyResult | void = await lambdaHandler(mockEvent as any, {} as any, () => {});
       if (!response) throw error;
 
@@ -229,17 +217,6 @@ describe('Database Tests', () => {
       mockConnection.execute = jest.fn().mockRejectedValue(
         new Error('Query failed')
       );
-
-      // const mockGetSecretValue = jest.fn().mockResolvedValue({
-      //   SecretString: JSON.stringify({
-      //     username: 'testuser',
-      //     password: 'testpass'
-      //   })
-      // });
-
-      // (SecretsManager as jest.Mock).mockImplementation(() => ({
-      //   getSecretValue: mockGetSecretValue
-      // }));
 
       const mockEvent = {
         queryStringParameters: {

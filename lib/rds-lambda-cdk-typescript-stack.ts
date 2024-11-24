@@ -1,63 +1,84 @@
-import * as cdk from 'aws-cdk-lib';
-import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as rds from 'aws-cdk-lib/aws-rds';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
-import * as apigateway from 'aws-cdk-lib/aws-apigateway';
-import * as cr from 'aws-cdk-lib/custom-resources';
-import * as path from 'path';
+import { 
+  Stack, 
+  StackProps, 
+  CustomResource, 
+  RemovalPolicy,
+  CfnOutput,
+  Duration 
+} from 'aws-cdk-lib';
+import { 
+  Function, 
+  Runtime, 
+  Code
+} from 'aws-cdk-lib/aws-lambda';
+import { 
+  Vpc, 
+  SecurityGroup, 
+  SubnetType, 
+  Port,
+  InstanceType,
+  InstanceClass,
+  InstanceSize 
+} from 'aws-cdk-lib/aws-ec2';
+import { 
+  DatabaseInstance, 
+  DatabaseInstanceEngine, 
+  MysqlEngineVersion,
+  Credentials 
+} from 'aws-cdk-lib/aws-rds';
+import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
+import { 
+  RestApi, 
+  LambdaIntegration 
+} from 'aws-cdk-lib/aws-apigateway';
+import { Provider } from 'aws-cdk-lib/custom-resources';
 import { Construct } from 'constructs';
+import * as path from 'path';
 
-// Custom construct for the Lambda-RDS setup
 export class RdsLambdaConstruct extends Construct {
-  public readonly handler: lambda.Function;
-  public readonly rdsInstance: rds.DatabaseInstance;
-  public readonly api: apigateway.RestApi;
+  public readonly handler: Function;
+  public readonly rdsInstance: DatabaseInstance;
+  public readonly api: RestApi;
 
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+  constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id);
 
-    // Create VPC
-    const vpc = new ec2.Vpc(this, 'RdsLambdaVpc', {
+    const vpc = new Vpc(this, 'RdsLambdaVpc', {
       maxAzs: 2,
       natGateways: 1,
       subnetConfiguration: [
         {
           cidrMask: 24,
           name: 'Private',
-          subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+          subnetType: SubnetType.PRIVATE_WITH_EGRESS,
         },
         {
           cidrMask: 24,
           name: 'Public',
-          subnetType: ec2.SubnetType.PUBLIC,
+          subnetType: SubnetType.PUBLIC,
         }
       ]
     });
 
-    // Create RDS Security Group
-    const rdsSecurityGroup = new ec2.SecurityGroup(this, 'RdsSecurityGroup', {
+    const rdsSecurityGroup = new SecurityGroup(this, 'RdsSecurityGroup', {
       vpc,
       description: 'Security group for RDS instance',
       allowAllOutbound: true,
     });
 
-    // Create Lambda Security Group
-    const lambdaSecurityGroup = new ec2.SecurityGroup(this, 'LambdaSecurityGroup', {
+    const lambdaSecurityGroup = new SecurityGroup(this, 'LambdaSecurityGroup', {
       vpc,
       description: 'Security group for Lambda function',
       allowAllOutbound: true,
     });
 
-    // Allow Lambda to connect to RDS
     rdsSecurityGroup.addIngressRule(
       lambdaSecurityGroup,
-      ec2.Port.tcp(3306),
+      Port.tcp(3306),
       'Allow Lambda connection to RDS'
     );
 
-    // Create RDS credentials in Secrets Manager
-    const databaseCredentials = new secretsmanager.Secret(this, 'DBCredentials', {
+    const databaseCredentials = new Secret(this, 'DBCredentials', {
       generateSecretString: {
         secretStringTemplate: JSON.stringify({ username: 'admin' }),
         generateStringKey: 'password',
@@ -65,27 +86,39 @@ export class RdsLambdaConstruct extends Construct {
       },
     });
 
-    // Create RDS instance
-    this.rdsInstance = new rds.DatabaseInstance(this, 'RdsInstance', {
-      engine: rds.DatabaseInstanceEngine.mysql({ version: rds.MysqlEngineVersion.VER_8_0 }),
+    this.rdsInstance = new DatabaseInstance(this, 'RdsInstance', {
+      engine: DatabaseInstanceEngine.mysql({ 
+        version: MysqlEngineVersion.VER_8_0 
+      }),
       vpc,
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
       },
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.T3, ec2.InstanceSize.MICRO),
+      instanceType: InstanceType.of(
+        InstanceClass.T3, 
+        InstanceSize.MICRO
+      ),
       securityGroups: [rdsSecurityGroup],
-      credentials: rds.Credentials.fromSecret(databaseCredentials),
-      removalPolicy: cdk.RemovalPolicy.DESTROY, // For development only
+      credentials: Credentials.fromSecret(databaseCredentials),
+      removalPolicy: RemovalPolicy.DESTROY,
     });
 
-    // Create Lambda function for database initialization
-    const dbInitFunction = new lambda.Function(this, 'DBInitFunction', {
-      runtime: lambda.Runtime.NODEJS_18_X,
+    const dbInitFunction = new Function(this, 'DBInitFunction', {
+      runtime: Runtime.NODEJS_18_X,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset(path.join(__dirname, 'db-init')),
+      code: Code.fromAsset(path.join(__dirname, 'db-init'), {
+        bundling: {
+          image: Runtime.NODEJS_18_X.bundlingImage,
+          command: [
+            'bash', '-c',
+            'npm install && npm run build && cp -r dist/* /asset-output/'
+          ],
+          user: 'root',
+        }
+      }),
       vpc,
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
       },
       securityGroups: [lambdaSecurityGroup],
       environment: {
@@ -93,34 +126,38 @@ export class RdsLambdaConstruct extends Construct {
         DB_HOST: this.rdsInstance.instanceEndpoint.hostname,
         DB_PORT: '3306',
       },
-      timeout: cdk.Duration.seconds(30),
+      timeout: Duration.seconds(30),
     });
 
-    // Grant permissions
     databaseCredentials.grantRead(dbInitFunction);
 
-    // Create Custom Resource
-    new cr.Provider(this, 'DBInitProvider', {
+    const dbInitProvider = new Provider(this, 'DBInitProvider', {
       onEventHandler: dbInitFunction,
     });
 
-    // This will run the init function when the stack is deployed
-    new cdk.CustomResource(this, 'DBInit', {
-      serviceToken: dbInitFunction.functionArn,
+    new CustomResource(this, 'DBInit', {
+      serviceToken: dbInitProvider.serviceToken,
       properties: {
-        timestamp: Date.now(), // Force run on every deployment
+        timestamp: Date.now(),
       },
     });
 
-    // Create Lambda function
-    // TODO: Bundling code
-    this.handler = new lambda.Function(this, 'RdsLambdaHandler', {
-      runtime: lambda.Runtime.NODEJS_18_X,
+    this.handler = new Function(this, 'RdsLambdaHandler', {
+      runtime: Runtime.NODEJS_18_X,
       handler: 'index.handler',
-      code: lambda.Code.fromAsset('lambda'),
+      code: Code.fromAsset('lambda', {
+        bundling: {
+          image: Runtime.NODEJS_18_X.bundlingImage,
+          command: [
+            'bash', '-c',
+            'npm install && npm run build && cp -r dist/* /asset-output/'
+          ],
+          user: 'root',
+        }
+      }),
       vpc,
       vpcSubnets: {
-        subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS,
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
       },
       securityGroups: [lambdaSecurityGroup],
       environment: {
@@ -128,30 +165,20 @@ export class RdsLambdaConstruct extends Construct {
         DB_HOST: this.rdsInstance.instanceEndpoint.hostname,
         DB_PORT: '3306',
       },
-      timeout: cdk.Duration.seconds(30),
+      timeout: Duration.seconds(30),
     });
 
-    // Grant Lambda access to RDS credentials
     databaseCredentials.grantRead(this.handler);
 
-    // Create API Gateway
-    this.api = new apigateway.RestApi(this, 'UsersApi', {
+    this.api = new RestApi(this, 'UsersApi', {
       restApiName: 'Users Service',
       description: 'This is the Users API'
     });
 
-    // Create API resource and method
     const users = this.api.root.addResource('users');
-    users.addMethod('GET', new apigateway.LambdaIntegration(this.handler));
+    users.addMethod('GET', new LambdaIntegration(this.handler));
 
-    // This will run the init function when the stack is deployed
-    new cdk.CustomResource(this, 'DBInit', {
-      serviceToken: dbInitFunction.functionArn,
-      properties: {
-        timestamp: Date.now(), // Force run on every deployment
-      },
-    });
-    new cdk.CfnOutput(this, 'ApiEndpoint', {
+    new CfnOutput(this, 'ApiEndpoint', {
       description: 'API Gateway endpoint URL',
       value: this.api.url,
       exportName: 'ApiEndpointUrl'
@@ -159,12 +186,9 @@ export class RdsLambdaConstruct extends Construct {
   }
 }
 
-// Main stack
-export class RdsLambdaCdkTypescriptStack extends cdk.Stack {
-  constructor(scope: Construct, id: string, props?: cdk.StackProps) {
+export class RdsLambdaCdkTypescriptStack extends Stack {
+  constructor(scope: Construct, id: string, props?: StackProps) {
     super(scope, id, props);
-
-    // Create the RDS-Lambda construct
     new RdsLambdaConstruct(this, 'RdsLambdaConstruct');
   }
 }
