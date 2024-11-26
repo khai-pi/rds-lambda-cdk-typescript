@@ -4,12 +4,14 @@ import {
   CustomResource, 
   RemovalPolicy,
   CfnOutput,
-  Duration 
+  Duration,
+  Tags
 } from 'aws-cdk-lib';
 import { 
   Function, 
   Runtime, 
-  Code
+  Code,
+  Architecture
 } from 'aws-cdk-lib/aws-lambda';
 import { 
   Vpc, 
@@ -18,177 +20,203 @@ import {
   Port,
   InstanceType,
   InstanceClass,
-  InstanceSize 
+  InstanceSize,
+  IpAddresses,
+  Peer,
+  InterfaceVpcEndpointAwsService
 } from 'aws-cdk-lib/aws-ec2';
 import { 
   DatabaseInstance, 
   DatabaseInstanceEngine, 
-  MysqlEngineVersion,
-  Credentials 
+  PostgresEngineVersion,
+  Credentials,
+  ParameterGroup
 } from 'aws-cdk-lib/aws-rds';
 import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
-import { 
-  RestApi, 
-  LambdaIntegration 
-} from 'aws-cdk-lib/aws-apigateway';
 import { Provider } from 'aws-cdk-lib/custom-resources';
 import { Construct } from 'constructs';
 import * as path from 'path';
+import { RetentionDays } from 'aws-cdk-lib/aws-logs';
+import { LambdaIntegration, RestApi } from 'aws-cdk-lib/aws-apigateway';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 
-export class RdsLambdaConstruct extends Construct {
-  public readonly handler: Function;
-  public readonly rdsInstance: DatabaseInstance;
-  public readonly api: RestApi;
-
+export class RdsLambdaCdkTypescriptStack extends Stack {
   constructor(scope: Construct, id: string, props?: StackProps) {
-    super(scope, id);
+    super(scope, id, props);
 
-    const vpc = new Vpc(this, 'RdsLambdaVpc', {
+    // VPC
+    const vpc = new Vpc(this, 'VpcLambda', {
+      ipAddresses: IpAddresses.cidr('10.0.0.0/16'),
       maxAzs: 2,
       natGateways: 1,
       subnetConfiguration: [
         {
           cidrMask: 24,
-          name: 'Private',
+          name: 'privatelambda',
           subnetType: SubnetType.PRIVATE_WITH_EGRESS,
         },
         {
           cidrMask: 24,
-          name: 'Public',
+          name: 'public',
           subnetType: SubnetType.PUBLIC,
-        }
-      ]
+        },
+      ],
     });
 
-    const rdsSecurityGroup = new SecurityGroup(this, 'RdsSecurityGroup', {
+    // Add VPC Endpoints
+    const secretsManagerEndpoint = vpc.addInterfaceEndpoint('SecretsManagerEndpoint', {
+      service: InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
+      subnets: {
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS
+      }
+    });
+
+    // Database Security Group
+    const dbSecurityGroup = new SecurityGroup(this, 'DbSecurityGroup', {
       vpc,
-      description: 'Security group for RDS instance',
-      allowAllOutbound: true,
+      description: 'Security group for PostgreSQL RDS instance',
+      allowAllOutbound: false
     });
 
-    const lambdaSecurityGroup = new SecurityGroup(this, 'LambdaSecurityGroup', {
+    // Database Parameter Group
+    const parameterGroup = new ParameterGroup(this, 'PostgresParameterGroup', {
+      engine: DatabaseInstanceEngine.postgres({ 
+        version: PostgresEngineVersion.VER_13 
+      }),
+      parameters: {
+        'max_connections': '50',
+        'shared_buffers': '32768',
+        'work_mem': '4096',
+        'maintenance_work_mem': '65536',
+        'timezone': 'UTC',
+        'max_prepared_transactions': '0',
+        'effective_cache_size': '98304'
+      }
+    });
+
+    const databaseName = 'pgdatabase';
+
+    // RDS Instance
+    const dbInstance = new DatabaseInstance(this, 'PostgresInstance', {
+      engine: DatabaseInstanceEngine.postgres({
+        version: PostgresEngineVersion.VER_13,
+      }),
+      instanceType: InstanceType.of(InstanceClass.T3, InstanceSize.MICRO),
       vpc,
-      description: 'Security group for Lambda function',
-      allowAllOutbound: true,
+      vpcSubnets: {
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+      },
+      databaseName,
+      securityGroups: [dbSecurityGroup],
+      credentials: Credentials.fromGeneratedSecret('postgres'),
+      maxAllocatedStorage: 20,
+      allocatedStorage: 5,
+      allowMajorVersionUpgrade: false,
+      autoMinorVersionUpgrade: true,
+      backupRetention: Duration.days(7),
+      deleteAutomatedBackups: true,
+      removalPolicy: RemovalPolicy.DESTROY,
+      parameterGroup,
+      publiclyAccessible: false,
+      storageEncrypted: true,
+      monitoringInterval: Duration.seconds(60),
     });
 
-    rdsSecurityGroup.addIngressRule(
-      lambdaSecurityGroup,
-      Port.tcp(3306),
-      'Allow Lambda connection to RDS'
+    // Lambda Security Group
+    const lambdaSG = new SecurityGroup(this, 'LambdaSG', {
+      vpc,
+      description: 'Security group for Lambda functions',
+      allowAllOutbound: false
+    });
+
+    // Lambda Function
+    const apiHandlerFunction = new NodejsFunction(this, 'ApiHandlerFunction', {
+      runtime: Runtime.NODEJS_18_X,
+      architecture: Architecture.ARM_64,
+      handler: 'handler',
+      entry: path.join(__dirname, '../lambda/handler.ts'),
+      environment: {
+        DB_HOST: dbInstance.dbInstanceEndpointAddress,
+        DB_PORT: '5432',
+        DB_NAME: databaseName,
+        DB_SECRET_ARN: dbInstance.secret?.secretFullArn || '',
+      },
+      bundling: {
+        externalModules: [
+          '@aws-sdk/client-secrets-manager'
+        ],
+        nodeModules: ['pg'],
+        forceDockerBundling: false,
+        minify: true,
+        sourceMap: true,
+        target: 'node18'
+      },
+      depsLockFilePath: path.join(__dirname, '../lambda/package-lock.json'),
+      vpc,
+      vpcSubnets: {
+        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
+      },
+      securityGroups: [lambdaSG],
+    });
+
+    // Grant permissions
+    dbInstance.secret?.grantRead(apiHandlerFunction);
+
+    // Security group rules
+    dbSecurityGroup.addIngressRule(
+      lambdaSG,
+      Port.tcp(5432),
+      'Allow Lambda to access PostgreSQL'
     );
 
-    const databaseCredentials = new Secret(this, 'DBCredentials', {
-      generateSecretString: {
-        secretStringTemplate: JSON.stringify({ username: 'admin' }),
-        generateStringKey: 'password',
-        excludePunctuation: true,
+    lambdaSG.addEgressRule(
+      dbSecurityGroup,
+      Port.tcp(5432),
+      'Allow Lambda to access PostgreSQL'
+    );
+
+    // Add egress rule for Secrets Manager VPC endpoint
+    lambdaSG.addEgressRule(
+      Peer.ipv4(vpc.vpcCidrBlock),
+      Port.tcp(443),
+      'Allow HTTPS access to VPC endpoints'
+    );
+
+    // API Gateway
+    const api = new RestApi(this, 'DatabaseAPI', {
+      description: 'API for PostgreSQL database operations',
+      deployOptions: {
+        stageName: 'dev',
+      },
+      defaultCorsPreflightOptions: {
+        allowOrigins: ['*'],
+        allowMethods: ['GET', 'POST', 'PUT', 'DELETE'],
       },
     });
 
-    this.rdsInstance = new DatabaseInstance(this, 'RdsInstance', {
-      engine: DatabaseInstanceEngine.mysql({ 
-        version: MysqlEngineVersion.VER_8_0 
-      }),
-      vpc,
-      vpcSubnets: {
-        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
-      },
-      instanceType: InstanceType.of(
-        InstanceClass.T3, 
-        InstanceSize.MICRO
-      ),
-      securityGroups: [rdsSecurityGroup],
-      credentials: Credentials.fromSecret(databaseCredentials),
-      removalPolicy: RemovalPolicy.DESTROY,
+    // API Resources
+    const usersApi = api.root.addResource('helloworld');
+    usersApi.addMethod('GET', new LambdaIntegration(apiHandlerFunction));
+    usersApi.addMethod('POST', new LambdaIntegration(apiHandlerFunction));
+
+    // Outputs
+    new CfnOutput(this, 'DatabaseEndpoint', {
+      value: dbInstance.dbInstanceEndpointAddress,
+      description: 'Database endpoint address',
     });
 
-    const dbInitFunction = new Function(this, 'DBInitFunction', {
-      runtime: Runtime.NODEJS_18_X,
-      handler: 'index.handler',
-      code: Code.fromAsset(path.join(__dirname, 'db-init'), {
-        bundling: {
-          image: Runtime.NODEJS_18_X.bundlingImage,
-          command: [
-            'bash', '-c',
-            'npm install && npm run build && cp -r dist/* /asset-output/'
-          ],
-          user: 'root',
-        }
-      }),
-      vpc,
-      vpcSubnets: {
-        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
-      },
-      securityGroups: [lambdaSecurityGroup],
-      environment: {
-        DB_SECRET_ARN: databaseCredentials.secretArn,
-        DB_HOST: this.rdsInstance.instanceEndpoint.hostname,
-        DB_PORT: '3306',
-      },
-      timeout: Duration.seconds(30),
+    new CfnOutput(this, 'DatabaseSecretArn', {
+      value: dbInstance.secret?.secretFullArn || 'No secret created',
+      description: 'Database credentials secret ARN',
     });
 
-    databaseCredentials.grantRead(dbInitFunction);
-
-    const dbInitProvider = new Provider(this, 'DBInitProvider', {
-      onEventHandler: dbInitFunction,
+    new CfnOutput(this, 'ApiUrl', {
+      value: api.url,
+      description: 'API endpoint URL',
     });
 
-    new CustomResource(this, 'DBInit', {
-      serviceToken: dbInitProvider.serviceToken,
-      properties: {
-        timestamp: Date.now(),
-      },
-    });
-
-    this.handler = new Function(this, 'RdsLambdaHandler', {
-      runtime: Runtime.NODEJS_18_X,
-      handler: 'index.handler',
-      code: Code.fromAsset('lambda', {
-        bundling: {
-          image: Runtime.NODEJS_18_X.bundlingImage,
-          command: [
-            'bash', '-c',
-            'npm install && npm run build && cp -r dist/* /asset-output/'
-          ],
-          user: 'root',
-        }
-      }),
-      vpc,
-      vpcSubnets: {
-        subnetType: SubnetType.PRIVATE_WITH_EGRESS,
-      },
-      securityGroups: [lambdaSecurityGroup],
-      environment: {
-        DB_SECRET_ARN: databaseCredentials.secretArn,
-        DB_HOST: this.rdsInstance.instanceEndpoint.hostname,
-        DB_PORT: '3306',
-      },
-      timeout: Duration.seconds(30),
-    });
-
-    databaseCredentials.grantRead(this.handler);
-
-    this.api = new RestApi(this, 'UsersApi', {
-      restApiName: 'Users Service',
-      description: 'This is the Users API'
-    });
-
-    const users = this.api.root.addResource('users');
-    users.addMethod('GET', new LambdaIntegration(this.handler));
-
-    new CfnOutput(this, 'ApiEndpoint', {
-      description: 'API Gateway endpoint URL',
-      value: this.api.url,
-      exportName: 'ApiEndpointUrl'
-    });
-  }
-}
-
-export class RdsLambdaCdkTypescriptStack extends Stack {
-  constructor(scope: Construct, id: string, props?: StackProps) {
-    super(scope, id, props);
-    new RdsLambdaConstruct(this, 'RdsLambdaConstruct');
+    // Tags
+    Tags.of(this).add('Environment', 'Development');
+    Tags.of(this).add('Project', 'PostgreSQL-Lambda');
   }
 }

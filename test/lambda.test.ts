@@ -1,207 +1,169 @@
-import { APIGatewayProxyEvent, APIGatewayProxyResult, Context, Callback } from 'aws-lambda';
+import { APIGatewayProxyEvent } from 'aws-lambda';
 import { SecretsManager } from '@aws-sdk/client-secrets-manager';
-import { createConnection, Connection, RowDataPacket } from 'mysql2/promise';
+import { Pool, QueryResult } from 'pg';
 import { handler } from '../lambda/handler';
 
-// Mock the AWS SDK and mysql2
+// Mock external dependencies
 jest.mock('@aws-sdk/client-secrets-manager');
-jest.mock('mysql2/promise');
+jest.mock('pg');
+
+// Mock environment variables
+process.env.DB_SECRET_ARN = 'test-secret-arn';
+process.env.DB_HOST = 'test-host';
+process.env.DB_PORT = '5432';
+process.env.DB_NAME = 'test-db';
 
 describe('Lambda Handler Tests', () => {
-  // Setup environment variables
-  const originalEnv = process.env;
+  let mockPool: jest.Mocked<Pool>;
+  let mockQuery: jest.MockedFunction<() => Promise<QueryResult<any>>>;
+  let mockSecretsManager: jest.Mocked<SecretsManager>;
 
   beforeEach(() => {
-    jest.resetAllMocks();
-    process.env = {
-      ...originalEnv,
-      DB_HOST: 'test-host',
-      DB_PORT: '3306',
-      DB_SECRET_ARN: 'test-secret-arn'
-    };
-  });
-
-  afterEach(() => {
-    process.env = originalEnv;
+    // Clear all mocks
     jest.clearAllMocks();
+
+    // Mock SecretsManager
+    mockSecretsManager = new SecretsManager() as jest.Mocked<SecretsManager>;
+    mockSecretsManager.getSecretValue = jest.fn().mockResolvedValue({
+      SecretString: JSON.stringify({
+        username: 'test-user',
+        password: 'test-password'
+      })
+    });
+    (SecretsManager as jest.Mock).mockImplementation(() => mockSecretsManager);
+
+    // Mock Pool
+    mockPool = {
+      query: jest.fn(),
+      on: jest.fn(),
+      end: jest.fn(),
+    } as unknown as jest.Mocked<Pool>;
+    (Pool as unknown as jest.Mock).mockImplementation(() => mockPool);
+
+    mockQuery = jest.fn().mockResolvedValue({
+      rows: [],
+      rowCount: 0,
+      command: '',
+      oid: 0,
+      fields: []
+    });
+
   });
 
-  const mockContext: Context = {
-    callbackWaitsForEmptyEventLoop: true,
-    functionName: 'test-function',
-    functionVersion: '1',
-    invokedFunctionArn: 'test-arn',
-    memoryLimitInMB: '128',
-    awsRequestId: 'test-request-id',
-    logGroupName: 'test-log-group',
-    logStreamName: 'test-log-stream',
-    getRemainingTimeInMillis: () => 1000,
-    done: () => {},
-    fail: () => {},
-    succeed: () => {},
-  };
+  describe('GET requests', () => {
+    it('should handle successful GET request', async () => {
+      // Mock the database query response
+      const mockTimestamp = new Date().toISOString();
+      mockQuery.mockResolvedValueOnce({
+        rows: [{ now: mockTimestamp }],
+        command: 'SELECT',
+        rowCount: 1,
+        oid: 0,
+        fields: []
+      });
 
-  const mockCallback: Callback<APIGatewayProxyResult> = jest.fn();
+      // Create mock event
+      const event: Partial<APIGatewayProxyEvent> = {
+        httpMethod: 'GET',
+      };
 
-  const mockEvent: APIGatewayProxyEvent = {
-    queryStringParameters: {
-      limit: '10',
-      offset: '0'
-    },
-    body: null,
-    headers: {},
-    multiValueHeaders: {},
-    httpMethod: 'GET',
-    isBase64Encoded: false,
-    path: '/users',
-    pathParameters: null,
-    multiValueQueryStringParameters: null,
-    stageVariables: null,
-    requestContext: {} as any,
-    resource: ''
-  };
+      // Execute handler
+      const response = await handler(event as APIGatewayProxyEvent);
 
-  interface MockDbRow extends RowDataPacket {
-    id: number;
-    name: string;
-  }
-
-  const mockSecretValue = {
-    username: 'testuser',
-    password: 'testpass'
-  };
-
-  const mockDbRows: MockDbRow[] = [
-    { id: 1, name: 'Test User 1' } as MockDbRow,
-    { id: 2, name: 'Test User 2' } as MockDbRow
-  ];
-
-  // Setup mocks before each test
-  beforeEach(() => {
-    // Mock SecretsManager getSecretValue
-    const mockGetSecretValue = jest.fn().mockResolvedValue({
-      SecretString: JSON.stringify(mockSecretValue)
+      // Assertions
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        message: 'Database connection successful',
+        timestamp: mockTimestamp
+      });
+      expect(mockPool.query).toHaveBeenCalledWith('SELECT NOW()');
     });
 
-    (SecretsManager as jest.Mock).mockImplementation(() => ({
-      getSecretValue: mockGetSecretValue
-    }));
+    it('should handle database query error', async () => {
+      // Mock database error
+      const secretsError = new Error('Database error');
+      mockSecretsManager.getSecretValue = jest.fn().mockImplementation(() => {
+        throw secretsError;
+      });
 
-    // Mock database connection
-    const mockExecute = jest.fn().mockResolvedValue([mockDbRows]);
-    const mockEnd = jest.fn().mockResolvedValue(undefined);
-    
-    (createConnection as jest.Mock).mockResolvedValue({
-      execute: mockExecute,
-      end: mockEnd
-    });
-  });
+      const event: Partial<APIGatewayProxyEvent> = {
+        httpMethod: 'GET',
+      };
 
-  test('successfully queries database with default parameters', async () => {
-    const response = await handler(mockEvent, mockContext, mockCallback);
+      const response = await handler(event as APIGatewayProxyEvent);
 
-    if (!response) {
-      throw new Error('Handler returned undefined');
-    }
-
-    expect(response.statusCode).toBe(200);
-    const body = JSON.parse(response.body);
-    expect(body).toEqual({
-      message: 'Success',
-      data: mockDbRows,
-      pagination: {
-        limit: 10,
-        offset: 0,
-        nextOffset: 10
-      }
-    });
-
-    expect(createConnection).toHaveBeenCalledWith({
-      host: 'test-host',
-      port: 3306,
-      user: 'testuser',
-      password: 'testpass',
-      database: 'mydb',
-      ssl: undefined
+      expect(response.statusCode).toBe(500);
+      expect(JSON.parse(response.body)).toEqual({
+        message: 'Internal server error',
+        error: 'Database error'
+      });
     });
   });
 
-  test('handles missing environment variables', async () => {
-    delete process.env.DB_HOST;
+  describe('POST requests', () => {
+    it('should handle successful POST request with body', async () => {
+      const testBody = { test: 'data' };
+      const event: Partial<APIGatewayProxyEvent> = {
+        httpMethod: 'POST',
+        body: JSON.stringify(testBody)
+      };
 
-    const response = await handler(mockEvent, mockContext, mockCallback);
-    
-    if (!response) {
-      throw new Error('Handler returned undefined');
-    }
+      const response = await handler(event as APIGatewayProxyEvent);
 
-    expect(response.statusCode).toBe(500);
-    expect(JSON.parse(response.body)).toEqual({
-      message: 'Server configuration error',
-      errorType: 'Error'
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        message: 'POST request successful',
+        body: testBody
+      });
+    });
+
+    it('should handle POST request with empty body', async () => {
+      const event: Partial<APIGatewayProxyEvent> = {
+        httpMethod: 'POST',
+        body: null
+      };
+
+      const response = await handler(event as APIGatewayProxyEvent);
+
+      expect(response.statusCode).toBe(200);
+      expect(JSON.parse(response.body)).toEqual({
+        message: 'POST request successful',
+        body: {}
+      });
     });
   });
 
-  test('handles database connection errors', async () => {
-    (createConnection as jest.Mock).mockRejectedValue(
-      new Error('ECONNREFUSED')
-    );
+  describe('Error handling', () => {
+    it('should handle unsupported HTTP methods', async () => {
+      const event: Partial<APIGatewayProxyEvent> = {
+        httpMethod: 'PUT'
+      };
 
-    const response = await handler(mockEvent, mockContext, mockCallback);
-    
-    if (!response) {
-      throw new Error('Handler returned undefined');
-    }
+      const response = await handler(event as APIGatewayProxyEvent);
 
-    expect(response.statusCode).toBe(503);
-    expect(JSON.parse(response.body)).toEqual({
-      message: 'Database connection failed',
-      errorType: 'Error'
-    });
-  });
-
-  test('handles invalid pagination parameters', async () => {
-    const eventWithInvalidParams: APIGatewayProxyEvent = {
-      ...mockEvent,
-      queryStringParameters: {
-        limit: '1000',
-        offset: '-5'
-      }
-    };
-
-    const response = await handler(eventWithInvalidParams, mockContext, mockCallback);
-    
-    if (!response) {
-      throw new Error('Handler returned undefined');
-    }
-
-    expect(response.statusCode).toBe(200);
-    const body = JSON.parse(response.body);
-    expect(body.pagination.limit).toBe(100);
-    expect(body.pagination.offset).toBe(0);
-  });
-
-  test('closes database connection in case of error', async () => {
-    const mockEnd = jest.fn().mockResolvedValue(undefined);
-    const mockExecute = jest.fn().mockRejectedValue(new Error('Query failed'));
-    
-    (createConnection as jest.Mock).mockResolvedValue({
-      execute: mockExecute,
-      end: mockEnd
+      expect(response.statusCode).toBe(405);
+      expect(JSON.parse(response.body)).toEqual({
+        message: 'Method not allowed'
+      });
     });
 
-    const response = await handler(mockEvent, mockContext, mockCallback);
-    
-    if (!response) {
-      throw new Error('Handler returned undefined');
-    }
+    it('should handle secrets manager error', async () => {
+      const secretsError = new Error('Secrets manager error');
+      mockSecretsManager.getSecretValue = jest.fn().mockImplementation(() => {
+        throw secretsError;
+      });
 
-    expect(response.statusCode).toBe(500);
-    expect(mockEnd).toHaveBeenCalled();
-  });
+      const event: Partial<APIGatewayProxyEvent> = {
+        httpMethod: 'GET'
+      };
 
-  test('sets callbackWaitsForEmptyEventLoop to false', async () => {
-    await handler(mockEvent, mockContext, mockCallback);
-    expect(mockContext.callbackWaitsForEmptyEventLoop).toBe(false);
+      const response = await handler(event as APIGatewayProxyEvent);
+
+      expect(response.statusCode).toBe(500);
+      expect(JSON.parse(response.body)).toEqual({
+        message: 'Internal server error',
+        error: 'Secrets manager error'
+      });
+    });
   });
 });

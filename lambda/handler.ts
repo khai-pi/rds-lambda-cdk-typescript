@@ -1,122 +1,106 @@
-import { APIGatewayProxyHandler, APIGatewayProxyResult } from 'aws-lambda';
 import { SecretsManager } from '@aws-sdk/client-secrets-manager';
-import { createConnection, Connection } from 'mysql2/promise';
+import { Pool } from 'pg';
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 
-interface DBSecret {
-  username: string;
-  password: string;
-}
-
-interface QueryParams {
-  limit: string;
-  offset: string;
-}
-
-export const handler: APIGatewayProxyHandler = async (event, context): Promise<APIGatewayProxyResult> => {
-  let connection: Connection | undefined;
-  
-  // Set this to false to prevent connection hanging
-  context.callbackWaitsForEmptyEventLoop = false;
+export const handler = async (
+  event: APIGatewayProxyEvent
+): Promise<APIGatewayProxyResult> => {
+  console.log('Event:', JSON.stringify(event, null, 2));
   
   try {
-    // Validate environment variables first
-    if (!process.env.DB_HOST) {
-      throw new Error('Server configuration error');
-    }
-
-    // Parse query parameters
-    const queryParams: QueryParams = {
-      limit: event.queryStringParameters?.limit || '10',
-      offset: event.queryStringParameters?.offset || '0'
-    };
-
-    // Get database credentials
+    // Get DB credentials from Secrets Manager
+    console.log('Getting DB credentials...');
     const secretsManager = new SecretsManager();
+    const secretArn = process.env.DB_SECRET_ARN!;
+    
+    console.log('Fetching secret:', secretArn);
     const secretResponse = await secretsManager.getSecretValue({
-      SecretId: process.env.DB_SECRET_ARN!
+      SecretId: secretArn
     });
-
+    
     if (!secretResponse.SecretString) {
       throw new Error('Database credentials not found');
     }
+    
+    const credentials = JSON.parse(secretResponse.SecretString);
+    console.log('Got credentials successfully');
 
-    const dbSecret: DBSecret = JSON.parse(secretResponse.SecretString);
-
-    // Create database connection
-    connection = await createConnection({
+    // Initialize DB pool
+    console.log('Initializing DB pool...');
+    const pool = new Pool({
+      user: credentials.username,
+      password: credentials.password,
       host: process.env.DB_HOST,
-      port: parseInt(process.env.DB_PORT || '3306'),
-      user: dbSecret.username,
-      password: dbSecret.password,
-      database: 'mydb'
-    }).catch(error => {
-      if (error.message.includes('ECONNREFUSED')) {
-        throw new Error('Database connection failed');
+      port: parseInt(process.env.DB_PORT || '5432'),
+      database: process.env.DB_NAME,
+      ssl: {
+        rejectUnauthorized: false
       }
-      throw error;
     });
 
-    // Validate and normalize parameters
-    const limit = Math.min(parseInt(queryParams.limit), 100);
-    const offset = Math.max(parseInt(queryParams.offset), 0);
+    // Handle different HTTP methods
+    switch (event.httpMethod) {
+      case 'GET':
+        console.log('Executing GET query...');
+        const result = await pool.query('SELECT NOW()');
+        await pool.end();
+        
+        return {
+          statusCode: 200,
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            message: 'Database connection successful',
+            timestamp: result.rows[0].now
+          })
+        };
 
-    // Execute query
-    const [rows] = await connection.execute(
-      'SELECT * FROM users LIMIT ? OFFSET ?',
-      [limit, offset]
-    );
-    
-    return {
-      statusCode: 200,
-      body: JSON.stringify({
-        message: 'Success',
-        data: rows,
-        pagination: {
-          limit,
-          offset,
-          nextOffset: offset + limit
-        }
-      })
-    };
+      case 'POST':
+        const body = JSON.parse(event.body || '{}');
+        await pool.end();
+        
+        return {
+          statusCode: 200,
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            message: 'POST request successful',
+            body: body
+          })
+        };
+
+      default:
+        return {
+          statusCode: 405,
+          body: JSON.stringify({
+            message: 'Method not allowed'
+          })
+        };
+    }
   } catch (error) {
-    console.error('Error:', error);
-    
-    let statusCode = 500;
-    let errorMessage = 'Internal server error';
-    let errorType = 'Error';
-
-    if (error instanceof Error) {
-      errorType = error.constructor.name;
-      switch (error.message) {
-        case 'Server configuration error':
-          statusCode = 500;
-          errorMessage = error.message;
-          break;
-        case 'Database connection failed':
-          statusCode = 503;
-          errorMessage = error.message;
-          break;
-        case 'Database credentials not found':
-          statusCode = 500;
-          errorMessage = error.message;
-          break;
+    console.error('Error details:', {
+      message: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+      name: error instanceof Error ? error.name : 'Unknown',
+      env: {
+        DB_HOST: process.env.DB_HOST,
+        DB_PORT: process.env.DB_PORT,
+        DB_NAME: process.env.DB_NAME,
+        HAS_SECRET_ARN: !!process.env.DB_SECRET_ARN
       }
-    }
+    });
 
     return {
-      statusCode,
+      statusCode: 500,
+      headers: {
+        'Content-Type': 'application/json'
+      },
       body: JSON.stringify({
-        message: errorMessage,
-        errorType
+        message: 'Internal server error',
+        error: error instanceof Error ? error.message : 'Unknown error'
       })
     };
-  } finally {
-    if (connection) {
-      try {
-        await connection.end();
-      } catch (error) {
-        console.error('Error closing connection:', error);
-      }
-    }
   }
 };

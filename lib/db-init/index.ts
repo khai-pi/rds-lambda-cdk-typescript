@@ -1,5 +1,5 @@
 import { SecretsManager } from '@aws-sdk/client-secrets-manager';
-import { createConnection } from 'mysql2/promise';
+import { Pool, PoolClient } from 'pg';
 import { 
   CloudFormationCustomResourceEvent, 
   CloudFormationCustomResourceResponse,
@@ -49,38 +49,105 @@ export class DatabaseInitializer {
   }
 
   public async initializeDatabase(credentials: DatabaseSecret, isCreate: boolean): Promise<void> {
-    const connection = await createConnection({
+    const pool = new Pool({
       host: this.config.host,
       port: this.config.port,
       user: credentials.username,
       password: credentials.password,
       database: this.config.database,
-      connectTimeout: 10000 // 10 second timeout
+      ssl: {
+        rejectUnauthorized: false // Note: In production, configure proper SSL
+      },
+      connectionTimeoutMillis: 10000 // 10 second timeout
     });
 
+    let client: PoolClient | null = null;
     try {
-      // Enable strict mode for better security
-      await connection.execute("SET sql_mode='STRICT_ALL_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE,ERROR_FOR_DIVISION_BY_ZERO'");
+      client = await pool.connect();
 
-      // Create users table with additional security features
-      await connection.execute(`
-        CREATE TABLE IF NOT EXISTS users (
-          id INT AUTO_INCREMENT PRIMARY KEY,
-          name VARCHAR(255) NOT NULL,
-          email VARCHAR(255) UNIQUE NOT NULL,
-          created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          deleted_at TIMESTAMP NULL DEFAULT NULL,
-          status ENUM('active', 'suspended', 'deleted') NOT NULL DEFAULT 'active',
-          last_login TIMESTAMP NULL DEFAULT NULL,
-          INDEX idx_email (email),
-          INDEX idx_status (status),
-          INDEX idx_deleted_at (deleted_at)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      // Set timezone and other session parameters
+      await client.query(`
+        SET TIME ZONE 'UTC';
+        SET search_path TO public;
       `);
-      
+
+      // Create extensions if needed
+      await client.query(`
+        CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+        CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+      `);
+
+      // Create custom types
+      await client.query(`
+        DO $$ 
+        BEGIN
+          IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'user_status') THEN
+            CREATE TYPE user_status AS ENUM ('active', 'suspended', 'deleted');
+          END IF;
+        END $$;
+      `);
+
+      // Create users table with PostgreSQL-specific features
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY,
+          uuid UUID DEFAULT uuid_generate_v4() NOT NULL UNIQUE,
+          name VARCHAR(255) NOT NULL,
+          email VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL,
+          deleted_at TIMESTAMP WITH TIME ZONE,
+          status user_status NOT NULL DEFAULT 'active',
+          last_login TIMESTAMP WITH TIME ZONE,
+          CONSTRAINT users_email_unique UNIQUE (email)
+        );
+
+        -- Create indexes
+        CREATE INDEX IF NOT EXISTS idx_users_email ON users (email);
+        CREATE INDEX IF NOT EXISTS idx_users_status ON users (status);
+        CREATE INDEX IF NOT EXISTS idx_users_deleted_at ON users (deleted_at);
+        
+        -- Create updated_at trigger
+        CREATE OR REPLACE FUNCTION update_updated_at()
+        RETURNS TRIGGER AS $$
+        BEGIN
+          NEW.updated_at = CURRENT_TIMESTAMP;
+          RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql;
+
+        -- Drop trigger if exists and create it
+        DROP TRIGGER IF EXISTS users_updated_at ON users;
+        CREATE TRIGGER users_updated_at
+          BEFORE UPDATE ON users
+          FOR EACH ROW
+          EXECUTE FUNCTION update_updated_at();
+      `);
+
+      // Add any additional security policies
+      await client.query(`
+        -- Row Level Security (RLS)
+        ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+        
+        -- Create policy for soft delete
+        CREATE POLICY users_soft_delete ON users
+          FOR ALL
+          USING (deleted_at IS NULL);
+          
+        -- Create policy for status check
+        CREATE POLICY users_active_only ON users
+          FOR ALL
+          USING (status = 'active');
+      `);
+
+    } catch (error) {
+      console.error('Error during database initialization:', error);
+      throw error;
     } finally {
-      await connection.end();
+      if (client) {
+        client.release();
+      }
+      await pool.end();
     }
   }
 
@@ -122,8 +189,8 @@ export const handler = async (
     new SecretsManager(),
     {
       host: process.env.DB_HOST || '',
-      port: parseInt(process.env.DB_PORT || '3306'),
-      database: process.env.DB_NAME || 'mydb'
+      port: parseInt(process.env.DB_PORT || '5432'), // PostgreSQL default port
+      database: process.env.DB_NAME || 'postgres'
     }
   );
 
