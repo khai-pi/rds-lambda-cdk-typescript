@@ -1,8 +1,0 @@
-{
-  "name": "lambda",
-  "version": "1.0.0",
-  "dependencies": {
-    "@aws-sdk/client-secrets-manager": "^3.485.0",
-    "pg": "^8.11.3"
-  }
-}

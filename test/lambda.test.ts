@@ -1,11 +1,30 @@
 import { APIGatewayProxyEvent } from 'aws-lambda';
-import { SecretsManager } from '@aws-sdk/client-secrets-manager';
+import { GetSecretValueCommandOutput, SecretsManager } from '@aws-sdk/client-secrets-manager';
 import { Pool, QueryResult } from 'pg';
 import { handler } from '../lambda/handler';
 
-// Mock external dependencies
-jest.mock('@aws-sdk/client-secrets-manager');
-jest.mock('pg');
+const mockSecretData: GetSecretValueCommandOutput = {
+  ARN: 'test-secret-arn',
+  Name: 'test_creds',
+  VersionId: 'x',
+  SecretString: '{"username":"test","password":"password"}',
+  VersionStages: ['x'],
+  CreatedDate: new Date(),
+  $metadata: {}
+};
+
+// Mock SecretsManager with correct error handling
+jest.mock('@aws-sdk/client-secrets-manager', () => {
+  return {
+    SecretsManager: jest.fn(() => ({
+      getSecretValue: jest.fn().mockResolvedValue(mockSecretData)
+  })
+  )};
+});
+// Mock modules
+jest.mock('pg', () => ({
+  Pool: jest.fn()
+}));
 
 // Mock environment variables
 process.env.DB_SECRET_ARN = 'test-secret-arn';
@@ -14,7 +33,10 @@ process.env.DB_PORT = '5432';
 process.env.DB_NAME = 'test-db';
 
 describe('Lambda Handler Tests', () => {
-  let mockPool: jest.Mocked<Pool>;
+  let mockPool: jest.Mocked<{
+    query: jest.Mock;
+    end: jest.Mock;
+  }>;
   let mockQuery: jest.MockedFunction<() => Promise<QueryResult<any>>>;
   let mockSecretsManager: jest.Mocked<SecretsManager>;
 
@@ -35,18 +57,17 @@ describe('Lambda Handler Tests', () => {
     // Mock Pool
     mockPool = {
       query: jest.fn(),
-      on: jest.fn(),
-      end: jest.fn(),
-    } as unknown as jest.Mocked<Pool>;
+      end: jest.fn()
+    };
     (Pool as unknown as jest.Mock).mockImplementation(() => mockPool);
 
-    mockQuery = jest.fn().mockResolvedValue({
-      rows: [],
-      rowCount: 0,
-      command: '',
-      oid: 0,
-      fields: []
-    });
+    // mockQuery = jest.fn().mockResolvedValue({
+    //   rows: [],
+    //   rowCount: 0,
+    //   command: '',
+    //   oid: 0,
+    //   fields: []
+    // });
 
   });
 
@@ -54,7 +75,7 @@ describe('Lambda Handler Tests', () => {
     it('should handle successful GET request', async () => {
       // Mock the database query response
       const mockTimestamp = new Date().toISOString();
-      mockQuery.mockResolvedValueOnce({
+      mockPool.query.mockResolvedValueOnce({
         rows: [{ now: mockTimestamp }],
         command: 'SELECT',
         rowCount: 1,
@@ -63,12 +84,23 @@ describe('Lambda Handler Tests', () => {
       });
 
       // Create mock event
-      const event: Partial<APIGatewayProxyEvent> = {
+      const event: APIGatewayProxyEvent = {
         httpMethod: 'GET',
+        body: null,
+        headers: {},
+        isBase64Encoded: false,
+        multiValueHeaders: {},
+        multiValueQueryStringParameters: null,
+        path: '/',
+        pathParameters: null,
+        queryStringParameters: null,
+        requestContext: {} as any,
+        resource: '',
+        stageVariables: null
       };
 
       // Execute handler
-      const response = await handler(event as APIGatewayProxyEvent);
+      const response = await handler(event);
 
       // Assertions
       expect(response.statusCode).toBe(200);
